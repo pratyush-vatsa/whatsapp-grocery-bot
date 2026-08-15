@@ -1,0 +1,9 @@
+.env
+swiggy_token.json
+welcomed_senders.json
+scheduled_orders.json
+swiggy_bug_report.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
