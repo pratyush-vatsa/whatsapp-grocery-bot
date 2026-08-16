@@ -16,7 +16,7 @@ import time
 import json
 import string
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 import requests
 from fastapi import FastAPI, Request, Response, BackgroundTasks
@@ -326,32 +326,36 @@ async def call_swiggy_tool(tool_name: str, arguments: dict) -> dict:
             return data
 
 
-async def resolve_instamart_address_id(address_label: str, fallback_label: str = None) -> str:
+async def resolve_instamart_address_id(address_label: str, fallback_label: str = None) -> tuple:
     """Matches our resolved address label (e.g. 'Home') against the
-    account's real saved Instamart addresses, returning the actual
-    addressId that search_products/checkout require.
+    account's real saved Instamart addresses, returning (addressId,
+    real_tag).
 
-    If address_label doesn't match a real saved address (e.g. a
-    misheard/misparsed override), falls back to the sender's actual
-    default (fallback_label) - NOT an arbitrary first address. Silently
-    guessing an unrelated real address (like defaulting to Work) is a
-    genuine safety issue, not just an inconvenience."""
+    real_tag is the ACTUAL matched Swiggy address tag - it can differ
+    from address_label when a fallback happened (e.g. a configured or
+    spoken label that doesn't match any real saved address). Callers
+    MUST display real_tag, never the raw input label - a real incident
+    showed a message confidently saying "Delivering to: Ayush" while
+    the order had silently fallen back to a completely different real
+    address, because the display used the raw label instead of what
+    was actually matched. Silently guessing an unrelated real address
+    is a genuine safety issue, not just an inconvenience."""
     result = await call_swiggy_tool("get_addresses", {})
     addresses = result.get("addresses") or []
 
     for addr in addresses:
         if addr.get("addressTag", "").lower() == address_label.lower():
-            return addr["id"]
+            return addr["id"], addr.get("addressTag", address_label)
 
     if fallback_label and fallback_label.lower() != address_label.lower():
         print(f"[address_fallback] '{address_label}' didn't match a saved address - trying default '{fallback_label}'")
         for addr in addresses:
             if addr.get("addressTag", "").lower() == fallback_label.lower():
-                return addr["id"]
+                return addr["id"], addr.get("addressTag", fallback_label)
 
     if addresses:
         print(f"[address_fallback] neither '{address_label}' nor default matched - using most recent address as last resort")
-        return addresses[0]["id"]
+        return addresses[0]["id"], addresses[0].get("addressTag", "your saved address")
     raise RuntimeError("No saved Instamart addresses found on this account - add one in the Swiggy app first.")
 
 
@@ -564,6 +568,9 @@ NEGATIVE_REPLIES = {"no", "n", "nahi", "cancel", "nope", "stop"}
 
 HELP_TEXT = (
     "👋 Hi! Just tell me what groceries you'd like, by voice or text - in Hindi, Hinglish, or English.\n\n"
+    "🕕 You can talk to me anytime, but I can only place a real order or add to cart between "
+    "*6 AM and 12 AM (midnight)*. Outside that? Say *\"schedule 8am\"* (or any time) and I'll place it "
+    "automatically once it's open.\n\n"
     "A few things you can say anytime:\n"
     "• *\"what's in my cart\"* - check what's really there\n"
     "• *\"clear cart\"* - empty it\n"
@@ -659,6 +666,9 @@ async def process_message(sender: str, message: dict):
         return
 
     if await maybe_handle_check_scheduled_command(sender, reply_text):
+        return
+
+    if await maybe_handle_stock_watch_command(sender, reply_text):
         return
 
     if await maybe_handle_check_cart_command(sender, reply_text):
@@ -957,6 +967,31 @@ async def prepare_real_cart(address_id: str, search_results: list) -> dict:
 
 MAX_ORDER_AMOUNT = int(os.environ.get("MAX_ORDER_AMOUNT", "500"))
 
+# Operating hours gate: the real Instamart store serving Home closes
+# overnight (roughly midnight-6am) even though other cities' stores
+# run 24h - rather than guessing Swiggy's specific "closed"/"surge"
+# wording (unverified, so not something we pattern-match on), we
+# enforce our OWN known-safe window and tell the person plainly
+# instead of letting a search/order silently fail at 2am.
+#
+# Fixed IST offset (UTC+5:30, no DST) rather than relying on the
+# server's local timezone - hosting platforms often default to UTC,
+# which would make this gate fire at completely the wrong times.
+IST = timezone(timedelta(hours=5, minutes=30))
+OPERATING_HOUR_START = 6   # 6:00 AM IST
+OPERATING_HOUR_END = 24    # midnight IST (exclusive) - 18 hours open
+
+
+def is_within_operating_hours() -> bool:
+    now_ist = datetime.now(IST)
+    return OPERATING_HOUR_START <= now_ist.hour < OPERATING_HOUR_END
+
+
+CLOSED_MESSAGE = (
+    "😴 I'm asleep right now! I only take orders between *6 AM and 12 AM (midnight)*.\n"
+    "Come back and message me anytime in that window."
+)
+
 
 # Box 7: scheduled orders - fire automatically at a chosen time, only
 # within a safe window (never place a real order unattended overnight).
@@ -1002,7 +1037,7 @@ def parse_schedule_time(text: str):
         hour += 12
     elif ampm == "am" and hour == 12:
         hour = 0
-    now = datetime.now()
+    now = datetime.now(IST)
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)
@@ -1037,7 +1072,7 @@ async def scheduled_orders_loop():
     global SHARED_CART
     while True:
         await asyncio.sleep(60)
-        now = datetime.now()
+        now = datetime.now(IST)
         due = [o for o in SCHEDULED_ORDERS if datetime.fromisoformat(o["fire_time"]) <= now]
         for order in due:
             SCHEDULED_ORDERS.remove(order)
@@ -1084,6 +1119,97 @@ async def scheduled_orders_loop():
             except Exception as e:
                 print(f"[error] scheduled order failed for {order['sender']}: {e}")
                 send_whatsapp_message(order["sender"], f"⏰ Sorry, your scheduled order failed to place: {e}\nPlease reorder manually.")
+
+
+# Box 8: "notify me when X is back in stock" - periodically re-checks a
+# specific item and messages the person once it's available again.
+STOCK_WATCHES_FILE = "stock_watches.json"
+STOCK_WATCH_CHECK_SECONDS = 30 * 60  # every 30 minutes
+
+NOTIFY_STOCK_PATTERN = re.compile(
+    r"(?:notify me|let me know|tell me|ping me)\s+(?:when|once)\s+(.+?)\s+(?:is|are)\s+(?:back\s+)?(?:in\s+stock|available)",
+    re.IGNORECASE,
+)
+
+
+def _load_stock_watches() -> list:
+    try:
+        with open(STOCK_WATCHES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_stock_watches():
+    with open(STOCK_WATCHES_FILE, "w") as f:
+        json.dump(STOCK_WATCHES, f)
+
+
+STOCK_WATCHES = _load_stock_watches()
+
+
+async def maybe_handle_stock_watch_command(sender: str, reply_text: str) -> bool:
+    """
+    Recognizes "notify me when X is back in stock" style requests and
+    sets up a recurring check. Uses the sender's default address (not
+    an override) since a stock watch outlives any single order.
+    """
+    match = NOTIFY_STOCK_PATTERN.search(reply_text)
+    if not match:
+        return False
+
+    item_name = match.group(1).strip()
+    default_label = ADDRESS_MAP.get(sender, "Home")
+    try:
+        address_id, real_label = await resolve_instamart_address_id(default_label, fallback_label=default_label)
+    except RuntimeError as e:
+        send_whatsapp_message(sender, f"Couldn't set that up: {e}")
+        return True
+
+    STOCK_WATCHES.append({
+        "sender": sender,
+        "item_name": item_name,
+        "address_id": address_id,
+        "address_label": real_label,
+        "added_at": time.time(),
+    })
+    _save_stock_watches()
+    send_whatsapp_message(
+        sender,
+        f"🔔 Got it — I'll check every 30 minutes and message you the moment \"{item_name}\" is back in stock "
+        f"at {real_label}."
+    )
+    return True
+
+
+async def stock_watch_loop():
+    """Runs forever: every 30 minutes, re-searches every watched item
+    and notifies + removes it the moment it's back in stock."""
+    while True:
+        await asyncio.sleep(STOCK_WATCH_CHECK_SECONDS)
+        still_watching = []
+        for watch in STOCK_WATCHES:
+            try:
+                result = await call_swiggy_tool("search_products", {"addressId": watch["address_id"], "query": watch["item_name"]})
+                products = result.get("products") or []
+                found_in_stock = False
+                if products:
+                    variations = (products[0].get("variations") or [])
+                    found_in_stock = any(v.get("isInStockAndAvailable") for v in variations)
+
+                if found_in_stock:
+                    send_whatsapp_message(
+                        watch["sender"],
+                        f"🔔 \"{watch['item_name']}\" is back in stock at {watch['address_label']}! "
+                        "Say what you'd like to order."
+                    )
+                else:
+                    still_watching.append(watch)
+            except Exception as e:
+                print(f"[error] stock watch check failed for '{watch['item_name']}': {e}")
+                still_watching.append(watch)
+        STOCK_WATCHES[:] = still_watching
+        _save_stock_watches()
 
 
 async def handle_fulfillment_choice(sender: str, reply_text: str):
@@ -1145,12 +1271,17 @@ async def handle_fulfillment_choice(sender: str, reply_text: str):
         return
 
     if is_short and "cart" in words and not is_cancel and "order" not in words:
+        if not is_within_operating_hours():
+            send_whatsapp_message(sender, CLOSED_MESSAGE + "\n\nYour order is still confirmed - try CART again once it's back in that window, or say \"schedule 8am\" (or any time) to place it automatically later.")
+            return
         try:
             actual_cart = await prepare_real_cart(pending["address_id"], pending["search_results"])
             breakdown = format_bill_breakdown(actual_cart)
+            item_lines, _ = build_order_lines(pending["search_results"])
             send_whatsapp_message(
                 sender,
-                "🛒 *Added to your cart*\n\n" + (breakdown or f"*Rs.{pending['total']}* total.") + "\n\n"
+                "🛒 *Added to your cart*\n\n" + "\n".join(item_lines) + "\n\n"
+                + (breakdown or f"*Rs.{pending['total']}* total.") + "\n\n"
                 "Want to add or change something? Tell me now, before opening the app.\n\n"
                 "⚠️ Open the Swiggy app only once, when you're fully done. If you don't pay, clear the cart there in the app."
             )
@@ -1246,7 +1377,7 @@ async def maybe_handle_check_cart_command(sender: str, reply_text: str) -> bool:
     # Nothing tracked in memory - fall back to a live check, with an
     # honest caveat given what we now know about get_cart's reliability.
     default_label = ADDRESS_MAP.get(sender, "Home")
-    address_id = await resolve_instamart_address_id(default_label, fallback_label=default_label)
+    address_id, _ = await resolve_instamart_address_id(default_label, fallback_label=default_label)
 
     try:
         cart = await call_swiggy_tool("get_cart", {"addressId": address_id})
@@ -1314,6 +1445,14 @@ async def handle_final_order_confirm(sender: str, reply_text: str):
         return
 
     if is_short and is_confirm and not is_cancel:
+        if not is_within_operating_hours():
+            send_whatsapp_message(
+                sender,
+                "😴 It's outside ordering hours (6 AM-12 AM) right now, so I can't place this for real. "
+                "Your order is still confirmed - just try ORDER again once it's back in that window, "
+                "or say CART to add it and pay yourself in the app."
+            )
+            return
         try:
             actual_cart = await prepare_real_cart(pending["address_id"], pending["search_results"])
         except Exception as e:
@@ -1354,9 +1493,11 @@ async def handle_final_order_confirm(sender: str, reply_text: str):
         try:
             checkout_result = await call_swiggy_tool("checkout", {"addressId": pending["address_id"], "paymentMethod": "Cash"})
             print(f"[checkout_result] {checkout_result}")
+            item_lines, _ = build_order_lines(pending["search_results"])
             send_whatsapp_message(
                 sender,
-                "✅ *Order placed!*\n\n" + (breakdown or f"Total: *Rs.{real_total}*")
+                "✅ *Order placed!*\n\n" + "\n".join(item_lines) + "\n\n"
+                + (breakdown or f"Total: *Rs.{real_total}*")
                 + f"\n📍 Delivering to: {pending['address_label']}\n\n"
                 "You'll get updates from Swiggy directly."
             )
@@ -1412,7 +1553,7 @@ async def maybe_handle_clear_cart_command(sender: str, reply_text: str) -> bool:
                 # address to target, or clear_cart repeats the exact
                 # no-address bug we already fixed for the tracked case.
                 default_label = ADDRESS_MAP.get(sender, "Home")
-                address_id = await resolve_instamart_address_id(default_label, fallback_label=default_label)
+                address_id, _ = await resolve_instamart_address_id(default_label, fallback_label=default_label)
             await call_swiggy_tool("clear_cart", {})  # takes no parameters, per authoritative docs
             try:
                 verify = await call_swiggy_tool("get_cart", {"addressId": address_id})
@@ -1454,6 +1595,7 @@ async def abandoned_cart_cleanup_loop():
 async def start_background_tasks():
     asyncio.create_task(abandoned_cart_cleanup_loop())
     asyncio.create_task(scheduled_orders_loop())
+    asyncio.create_task(stock_watch_loop())
 
 
 def _cart_is_stale() -> bool:
@@ -1469,7 +1611,13 @@ async def handle_new_order_request(sender: str, transcript_or_text: str):
     ANYONE in the family), a new message is treated as an ADDITION to
     that same order/address rather than an unrelated new order - this
     also keeps everything on the correct address, and prevents two
-    people's orders from silently clobbering each other."""
+    people's orders from silently clobbering each other.
+
+    Deliberately NOT gated by operating hours here - searching,
+    confirming, and scheduling an order for later are all fine at any
+    time (nothing real happens yet). Only actions that touch the real
+    account RIGHT NOW - placing a real order, or adding to the real
+    cart - are gated, and only at the point they actually happen."""
     global SHARED_CART
     try:
         parsed = parse_request(transcript_or_text)
@@ -1500,8 +1648,8 @@ async def handle_new_order_request(sender: str, transcript_or_text: str):
         default_label = ADDRESS_MAP.get(sender)
         address_label = resolve_address(sender, parsed.get("address_override"))
         try:
-            address_id = await resolve_instamart_address_id(address_label, fallback_label=default_label)
-            await search_and_confirm(sender, address_id, address_label, parsed["items"])
+            address_id, real_address_label = await resolve_instamart_address_id(address_label, fallback_label=default_label)
+            await search_and_confirm(sender, address_id, real_address_label, parsed["items"])
         except RuntimeError as e:
             print(f"[error] Swiggy call failed: {e}")
             send_whatsapp_message(sender, f"(Box 4 test) Swiggy connection issue: {e}")
