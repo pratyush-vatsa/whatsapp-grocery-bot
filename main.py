@@ -763,10 +763,17 @@ async def search_and_confirm(sender: str, address_id: str, address_label: str, i
 def classify_pending_reply(current_search_results: list, reply_text: str) -> dict:
     """
     Figures out what a reply to a pending confirmation actually means:
-    confirming, cancelling, or changing something. If modifying, Gemini
-    returns the COMPLETE updated item list (not just a diff) - the
-    caller just re-searches everything fresh from that list, which is
-    simpler and safer than trying to patch individual items in place.
+    confirming, cancelling, changing an item, or changing the delivery
+    address. If modifying, Gemini returns the COMPLETE updated item list
+    (not just a diff) - the caller just re-searches everything fresh
+    from that list, which is simpler and safer than trying to patch
+    individual items in place.
+
+    Also recognizes address changes ("deliver to Ayush instead") as
+    their own thing, separate from item changes - a real incident
+    showed a reply like this getting misread as "confirm" simply
+    because address changes had nowhere valid to go in the output
+    before this was added.
 
     Important: given BOTH the original request AND the actual matched
     product name for each item - not just the original request. A user
@@ -798,8 +805,9 @@ They replied: "{reply_text}"
 
 Decide their intent and respond with STRICT JSON only, no markdown fences:
 {{
-  "intent": "confirm" | "cancel" | "modify",
-  "items": [...]
+  "intent": "confirm" | "cancel" | "modify" | "change_address",
+  "items": [...],
+  "address_override": "<address name if intent is change_address, else null>"
 }}
 
 Rules:
@@ -809,6 +817,15 @@ Rules:
   person could be reading it back to verify it, questioning it, or about
   to correct it. Only classify as "confirm" when there's an actual
   affirming word or clear approval - never from a restated detail alone.
+- "change_address": the reply is ONLY about where to deliver (e.g.
+  "deliver to Ayush", "send it to Bangalore instead", "change address to
+  Home") - set address_override to that address name, and "items" to an
+  empty list. Do NOT classify this as "confirm" just because it sounds
+  like a definitive statement - naming a delivery address is never
+  itself an approval of the order. If the SAME reply also changes items
+  (e.g. "add milk and deliver to Ayush"), use "modify" instead, and put
+  the address in address_override alongside the updated items list -
+  address changes and item changes can happen together in one modify.
 - "cancel": cancelling entirely (a clear, standalone "no", "cancel", "nahi",
   "stop", "don't order the whole thing"). A negative word like "nahi"
   appearing PARTWAY THROUGH a longer sentence that's correcting one specific
@@ -829,7 +846,8 @@ Rules:
   the ORIGINALLY_REQUESTED format (name, brand, quantity, size) for every
   item that should remain - keep unchanged items, remove what they asked to
   remove, add what they asked to add.
-- When intent is "confirm" or "cancel", "items" can be an empty list.
+- When intent is "confirm" or "cancel", "items" can be an empty list, and
+  address_override should be null.
 
 CRITICAL RULE on quantity vs size - getting this wrong once already caused a
 near-Rs.8000 mistaken order, so follow it exactly for every item in "items":
@@ -854,6 +872,18 @@ near-Rs.8000 mistaken order, so follow it exactly for every item in "items":
             raw_text = raw_text[4:].strip()
 
     return json.loads(raw_text)
+
+
+async def _resolve_address_override_or_keep(pending: dict, override) -> tuple:
+    """If an address_override was given (e.g. from a 'deliver to Ayush'
+    correction), re-resolves it against the account's real saved
+    addresses; otherwise keeps the pending order's existing address
+    unchanged. Returns (address_id, address_label). Can raise
+    RuntimeError if no saved addresses match at all - callers should
+    catch this and tell the person plainly."""
+    if not override:
+        return pending["address_id"], pending["address_label"]
+    return await resolve_instamart_address_id(override, fallback_label=pending["address_label"])
 
 
 async def handle_confirmation_reply(sender: str, reply_text: str):
@@ -902,8 +932,21 @@ async def handle_confirmation_reply(sender: str, reply_text: str):
     elif intent == "cancel":
         send_whatsapp_message(sender, "Okay, cancelled - nothing was ordered.")
         del PENDING_ORDERS[sender]
+    elif intent == "change_address":
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
+        items = [r["item"] for r in pending["search_results"] if r["status"] == "found"]
+        await search_and_confirm(sender, address_id, address_label, items)
     elif intent == "modify" and result.get("items"):
-        await search_and_confirm(sender, pending["address_id"], pending["address_label"], result["items"])
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
+        await search_and_confirm(sender, address_id, address_label, result["items"])
     else:
         send_whatsapp_message(sender, "Sorry, I didn't catch that - reply YES to confirm, NO to cancel, or tell me what to change.")
 
@@ -1470,11 +1513,25 @@ async def handle_fulfillment_choice(sender: str, reply_text: str):
     if intent == "cancel":
         send_whatsapp_message(sender, "Okay, cancelled - nothing was ordered or added to cart.")
         del PENDING_FULFILLMENT_CHOICE[sender]
+    elif intent == "change_address":
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
+        del PENDING_FULFILLMENT_CHOICE[sender]
+        items = [r["item"] for r in pending["search_results"] if r["status"] == "found"]
+        await search_and_confirm(sender, address_id, address_label, items)
     elif intent == "modify" and result.get("items"):
         # Went back to correcting items - return to the item-confirmation
         # stage instead of staying stuck on the ORDER/CART question.
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
         del PENDING_FULFILLMENT_CHOICE[sender]
-        await search_and_confirm(sender, pending["address_id"], pending["address_label"], result["items"])
+        await search_and_confirm(sender, address_id, address_label, result["items"])
     else:
         send_whatsapp_message(sender, "Sorry, I didn't catch that - reply ORDER to place it now, CART to just add the items, or NO to cancel everything.")
 
@@ -1684,9 +1741,23 @@ async def handle_final_order_confirm(sender: str, reply_text: str):
     if intent == "cancel":
         send_whatsapp_message(sender, "Okay, cancelled - nothing was ordered.")
         del PENDING_FINAL_CONFIRM[sender]
-    elif intent == "modify" and result.get("items"):
+    elif intent == "change_address":
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
         del PENDING_FINAL_CONFIRM[sender]
-        await search_and_confirm(sender, pending["address_id"], pending["address_label"], result["items"])
+        items = [r["item"] for r in pending["search_results"] if r["status"] == "found"]
+        await search_and_confirm(sender, address_id, address_label, items)
+    elif intent == "modify" and result.get("items"):
+        try:
+            address_id, address_label = await _resolve_address_override_or_keep(pending, result.get("address_override"))
+        except RuntimeError as e:
+            send_whatsapp_message(sender, f"Couldn't change the address: {e}")
+            return
+        del PENDING_FINAL_CONFIRM[sender]
+        await search_and_confirm(sender, address_id, address_label, result["items"])
     else:
         send_whatsapp_message(sender, "Sorry, I didn't catch that - reply ORDER to confirm, NO to cancel, or tell me what to change.")
 
