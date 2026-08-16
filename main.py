@@ -345,27 +345,45 @@ async def resolve_instamart_address_id(address_label: str, fallback_label: str =
     account's real saved Instamart addresses, returning (addressId,
     real_tag).
 
-    real_tag is the ACTUAL matched Swiggy address tag - it can differ
-    from address_label when a fallback happened (e.g. a configured or
-    spoken label that doesn't match any real saved address). Callers
-    MUST display real_tag, never the raw input label - a real incident
-    showed a message confidently saying "Delivering to: Ayush" while
-    the order had silently fallen back to a completely different real
-    address, because the display used the raw label instead of what
-    was actually matched. Silently guessing an unrelated real address
-    is a genuine safety issue, not just an inconvenience."""
+    Checks BOTH addressTag AND the recipient name at the start of the
+    saved addressLine (e.g. "Ayush: Flat No. 2..."). A real incident
+    proved these can genuinely differ - renaming an address in the
+    Swiggy app doesn't necessarily update its addressTag field, so
+    matching on addressTag alone silently failed for an address the
+    person had clearly renamed and expected to work.
+
+    real_tag is the ACTUAL matched value - it can differ from
+    address_label when a fallback happened (e.g. a spoken label that
+    doesn't match any real saved address). Callers MUST display
+    real_tag, never the raw input label - a real incident showed a
+    message confidently saying "Delivering to: Ayush" while the order
+    had silently fallen back to a completely different real address,
+    because the display used the raw label instead of what was
+    actually matched. Silently guessing an unrelated real address is a
+    genuine safety issue, not just an inconvenience."""
     result = await call_swiggy_tool("get_addresses", {})
     addresses = result.get("addresses") or []
 
-    for addr in addresses:
-        if addr.get("addressTag", "").lower() == address_label.lower():
-            return addr["id"], addr.get("addressTag", address_label)
+    def _find_match(label: str):
+        label_norm = label.strip().lower()
+        for addr in addresses:
+            if (addr.get("addressTag") or "").strip().lower() == label_norm:
+                return addr, addr.get("addressTag", label)
+        for addr in addresses:
+            recipient_name = (addr.get("addressLine") or "").split(":", 1)[0].strip().lower()
+            if recipient_name == label_norm:
+                return addr, label  # show back what they actually said, since that's what they'll recognize
+        return None, None
+
+    addr, matched_label = _find_match(address_label)
+    if addr:
+        return addr["id"], matched_label
 
     if fallback_label and fallback_label.lower() != address_label.lower():
         print(f"[address_fallback] '{address_label}' didn't match a saved address - trying default '{fallback_label}'")
-        for addr in addresses:
-            if addr.get("addressTag", "").lower() == fallback_label.lower():
-                return addr["id"], addr.get("addressTag", fallback_label)
+        addr, matched_label = _find_match(fallback_label)
+        if addr:
+            return addr["id"], matched_label
 
     if addresses:
         print(f"[address_fallback] neither '{address_label}' nor default matched - using most recent address as last resort")
