@@ -679,6 +679,12 @@ async def process_message(sender: str, message: dict):
     if await maybe_handle_repeat_order_command(sender, reply_text):
         return
 
+    if await maybe_handle_cancel_scheduled_command(sender, reply_text):
+        return
+
+    if await maybe_handle_edit_scheduled_command(sender, reply_text):
+        return
+
     if await maybe_handle_check_scheduled_command(sender, reply_text):
         return
 
@@ -798,6 +804,11 @@ Decide their intent and respond with STRICT JSON only, no markdown fences:
 
 Rules:
 - "confirm": approving the order as shown (yes, haan, correct, looks good).
+  IMPORTANT: simply repeating back an item's name, size, or price (e.g.
+  "Mangalam Kapoor 100gm Rs195") is NOT by itself a confirmation - the
+  person could be reading it back to verify it, questioning it, or about
+  to correct it. Only classify as "confirm" when there's an actual
+  affirming word or clear approval - never from a restated detail alone.
 - "cancel": cancelling entirely (a clear, standalone "no", "cancel", "nahi",
   "stop", "don't order the whole thing"). A negative word like "nahi"
   appearing PARTWAY THROUGH a longer sentence that's correcting one specific
@@ -904,7 +915,7 @@ def ask_fulfillment_choice(sender: str):
     send_whatsapp_message(
         sender,
         "Place the order now, or add to cart to pay yourself in the app?\n"
-        "Reply *ORDER*, *CART*, or *\"schedule 8pm\"* to place it later."
+        "Reply *ORDER*, *CART*, or *\"schedule 8pm\"* to place it later - or tell me what to add or change."
     )
 
 
@@ -1072,6 +1083,92 @@ async def maybe_handle_check_scheduled_command(sender: str, reply_text: str) -> 
         for o in mine
     ]
     send_whatsapp_message(sender, "⏰ *Your scheduled orders:*\n" + "\n".join(lines))
+    return True
+
+
+CANCEL_SCHEDULED_PHRASES = {"cancel scheduled", "cancel my scheduled order", "cancel the scheduled order", "remove scheduled order", "cancel schedule"}
+
+
+async def maybe_handle_cancel_scheduled_command(sender: str, reply_text: str) -> bool:
+    """Cancels ALL of this sender's scheduled orders. Kept simple -
+    most people will only ever have one scheduled at a time."""
+    normalized = reply_text.strip().lower()
+    if not any(p in normalized for p in CANCEL_SCHEDULED_PHRASES):
+        return False
+
+    mine = [o for o in SCHEDULED_ORDERS if o["sender"] == sender]
+    if not mine:
+        send_whatsapp_message(sender, "You don't have any scheduled orders to cancel.")
+        return True
+
+    SCHEDULED_ORDERS[:] = [o for o in SCHEDULED_ORDERS if o["sender"] != sender]
+    _save_scheduled_orders()
+    times = ", ".join(datetime.fromisoformat(o["fire_time"]).strftime("%I:%M %p on %b %d") for o in mine)
+    send_whatsapp_message(sender, f"🗑️ Cancelled your scheduled order(s) for {times}.")
+    return True
+
+
+ADD_TO_SCHEDULE_PATTERN = re.compile(r"add\s+(.+?)\s+to\s+(?:my\s+)?scheduled\s+order", re.IGNORECASE)
+REMOVE_FROM_SCHEDULE_PATTERN = re.compile(r"remove\s+(.+?)\s+from\s+(?:my\s+)?scheduled\s+order", re.IGNORECASE)
+
+
+def _recompute_scheduled_total(scheduled_order: dict):
+    scheduled_order["total"] = sum(
+        r["price"] * r["item"]["quantity"] for r in scheduled_order["search_results"] if r["status"] == "found"
+    )
+
+
+async def maybe_handle_edit_scheduled_command(sender: str, reply_text: str) -> bool:
+    """
+    Lets someone add to or remove from an already-scheduled order before
+    it fires - e.g. "add 1kg tomatoes to my scheduled order" or "remove
+    milk from my scheduled order". If there's more than one scheduled
+    order for this sender, targets whichever fires soonest, and says so.
+    """
+    add_match = ADD_TO_SCHEDULE_PATTERN.search(reply_text)
+    remove_match = REMOVE_FROM_SCHEDULE_PATTERN.search(reply_text)
+    if not add_match and not remove_match:
+        return False
+
+    mine = sorted((o for o in SCHEDULED_ORDERS if o["sender"] == sender), key=lambda o: o["fire_time"])
+    if not mine:
+        send_whatsapp_message(sender, "You don't have a scheduled order to change.")
+        return True
+    target = mine[0]
+    fire_time_str = datetime.fromisoformat(target["fire_time"]).strftime("%I:%M %p on %b %d")
+
+    if add_match:
+        item_text = add_match.group(1).strip()
+        parsed = parse_request(item_text)
+        if parsed.get("needs_clarification") or not parsed.get("items"):
+            send_whatsapp_message(sender, "Couldn't figure out what to add - try like \"add 1 kg onions to my scheduled order\".")
+            return True
+        new_results = [await search_grocery_item(target["address_id"], item) for item in parsed["items"]]
+        target["search_results"] = target["search_results"] + new_results
+    else:
+        item_name = remove_match.group(1).strip().lower()
+        before_count = len(target["search_results"])
+        target["search_results"] = [
+            r for r in target["search_results"]
+            if item_name not in (r.get("product_name") or "").lower() and item_name not in (r["item"].get("name") or "").lower()
+        ]
+        if len(target["search_results"]) == before_count:
+            send_whatsapp_message(sender, f"Couldn't find \"{item_name}\" in your order scheduled for {fire_time_str}.")
+            return True
+        if not target["search_results"]:
+            SCHEDULED_ORDERS.remove(target)
+            _save_scheduled_orders()
+            send_whatsapp_message(sender, f"Removed {item_name} - that was everything, so I cancelled the order scheduled for {fire_time_str}.")
+            return True
+
+    _recompute_scheduled_total(target)
+    _save_scheduled_orders()
+    lines, total = build_order_lines(target["search_results"])
+    send_whatsapp_message(
+        sender,
+        f"✏️ *Updated your order scheduled for {fire_time_str}:*\n\n" + "\n".join(lines)
+        + f"\n\n💰 Estimated total: Rs.{total} (at today's prices)"
+    )
     return True
 
 
@@ -1249,6 +1346,12 @@ async def handle_fulfillment_choice(sender: str, reply_text: str):
     is_cancel = bool(words & NEGATIVE_REPLIES)
 
     if is_short and is_cancel:
+        async with CART_LOCK:
+            try:
+                await call_swiggy_tool("clear_cart", {})
+            except Exception as e:
+                print(f"[error] clear on cancel failed: {e}")
+        SHARED_CART = None
         send_whatsapp_message(sender, "Okay, cancelled - nothing was ordered or added to cart.")
         del PENDING_FULFILLMENT_CHOICE[sender]
         return
@@ -1320,17 +1423,35 @@ async def handle_fulfillment_choice(sender: str, reply_text: str):
         return
 
     if is_short and "order" in words and not is_cancel and "cart" not in words:
+        if not is_within_operating_hours():
+            send_whatsapp_message(sender, CLOSED_MESSAGE + "\n\nYour order is still confirmed - try ORDER again once it's back in that window, or say \"schedule 8am\" (or any time) to place it automatically later.")
+            return
         # Don't check out yet - one more explicit confirmation first,
-        # showing the order again in full. Added after a near-miss where
-        # a chain of small misunderstandings almost triggered a real,
-        # unwanted checkout with no final safety gate in between.
+        # showing the REAL order total (including fees) again in full.
+        # This now actually stages the cart (same as CART does -
+        # reversible, nothing charged) so the total shown here is the
+        # real number, not an item-only estimate - a real incident
+        # showed someone confirming based on an estimate, then
+        # discovering a higher REAL total only after already saying
+        # ORDER twice, which is exactly the wrong place for a surprise.
+        try:
+            actual_cart = await prepare_real_cart(pending["address_id"], pending["search_results"])
+        except Exception as e:
+            import traceback
+            print(f"[error] preparing cart for final check failed: {e}")
+            traceback.print_exc()
+            send_whatsapp_message(sender, f"Sorry, something went wrong checking the order: {e}")
+            del PENDING_FULFILLMENT_CHOICE[sender]
+            return
+
+        breakdown = format_bill_breakdown(actual_cart)
         del PENDING_FULFILLMENT_CHOICE[sender]
         PENDING_FINAL_CONFIRM[sender] = pending
         lines, _ = build_order_lines(pending["search_results"])
         send_whatsapp_message(
             sender,
             "🧾 *Final check before placing this order:*\n\n" + "\n".join(lines)
-            + f"\n\n💰 *Total: Rs.{pending['total']}*\n📍 {pending['address_label']}\n\n"
+            + "\n\n" + (breakdown or f"💰 *Total: Rs.{pending['total']}*") + f"\n📍 {pending['address_label']}\n\n"
             "Reply *ORDER* again to place it for real, *NO* to cancel, or tell me what to change."
         )
         return
@@ -1454,6 +1575,12 @@ async def handle_final_order_confirm(sender: str, reply_text: str):
     is_confirm = bool(words & AFFIRMATIVE_REPLIES) or "order" in words
 
     if is_short and is_cancel:
+        async with CART_LOCK:
+            try:
+                await call_swiggy_tool("clear_cart", {})
+            except Exception as e:
+                print(f"[error] clear on cancel failed: {e}")
+        SHARED_CART = None
         send_whatsapp_message(sender, "Okay, cancelled - nothing was ordered.")
         del PENDING_FINAL_CONFIRM[sender]
         return
@@ -1508,12 +1635,28 @@ async def handle_final_order_confirm(sender: str, reply_text: str):
             checkout_result = await call_swiggy_tool("checkout", {"addressId": pending["address_id"], "paymentMethod": "Cash"})
             print(f"[checkout_result] {checkout_result}")
             item_lines, _ = build_order_lines(pending["search_results"])
+
+            # Best-effort ETA extraction - we haven't yet confirmed the
+            # exact field Swiggy uses for this, so this tries a few
+            # plausible keys and simply omits the line if none are
+            # present, rather than guessing a value. [checkout_result]
+            # is logged above in full either way, for refining this later.
+            delivery_eta = None
+            for key in ("sla", "eta", "estimatedDeliveryTime", "deliveryTime", "estimatedTime"):
+                val = checkout_result.get(key) if isinstance(checkout_result, dict) else None
+                if val:
+                    delivery_eta = val
+                    break
+            eta_line = f"\n⏱️ Estimated delivery: {delivery_eta}" if delivery_eta else ""
+
             send_whatsapp_message(
                 sender,
                 "✅ *Order placed!*\n\n" + "\n".join(item_lines) + "\n\n"
                 + (breakdown or f"Total: *Rs.{real_total}*")
-                + f"\n📍 Delivering to: {pending['address_label']}\n\n"
-                "You'll get updates from Swiggy directly."
+                + f"\n📍 Delivering to: {pending['address_label']}"
+                + "\n💳 Payment: Cash on Delivery"
+                + eta_line
+                + "\n\nYou'll get updates from Swiggy directly."
             )
             SHARED_CART = None
             LAST_ORDER_ITEMS[sender] = {
