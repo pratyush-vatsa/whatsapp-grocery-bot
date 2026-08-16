@@ -283,47 +283,61 @@ async def call_swiggy_tool(tool_name: str, arguments: dict) -> dict:
     token = load_swiggy_token()
     headers = {"Authorization": f"Bearer {token}"}
 
-    async with streamablehttp_client("https://mcp.swiggy.com/im", headers=headers) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments=arguments)
-            text_content = result.content[0].text if result.content else ""
-            structured = getattr(result, "structuredContent", None)
-            print(f"[swiggy_raw] tool={tool_name} args={arguments} isError={getattr(result, 'isError', False)}")
-            print(f"[swiggy_structured] {structured}")
-            print(f"[swiggy_text] {text_content[:300]}{'...(truncated)' if len(text_content) > 300 else ''}")
+    try:
+        async with streamablehttp_client("https://mcp.swiggy.com/im", headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments=arguments)
+                text_content = result.content[0].text if result.content else ""
+                structured = getattr(result, "structuredContent", None)
+                print(f"[swiggy_raw] tool={tool_name} args={arguments} isError={getattr(result, 'isError', False)}")
+                print(f"[swiggy_structured] {structured}")
+                print(f"[swiggy_text] {text_content[:300]}{'...(truncated)' if len(text_content) > 300 else ''}")
 
-            if getattr(result, "isError", False):
-                raise RuntimeError(f"Swiggy tool '{tool_name}' returned an error: {text_content}")
+                if getattr(result, "isError", False):
+                    raise RuntimeError(f"Swiggy tool '{tool_name}' returned an error: {text_content}")
 
-            # Backup check: some failures show up as error-shaped TEXT
-            # without the isError flag actually being set. Don't trust
-            # the flag alone for something this consequential.
-            if "is required" in text_content or "Report ID:" in text_content:
-                raise RuntimeError(f"Swiggy tool '{tool_name}' likely failed (error-shaped text): {text_content}")
+                # Backup check: some failures show up as error-shaped TEXT
+                # without the isError flag actually being set. Don't trust
+                # the flag alone for something this consequential.
+                if "is required" in text_content or "Report ID:" in text_content:
+                    raise RuntimeError(f"Swiggy tool '{tool_name}' likely failed (error-shaped text): {text_content}")
 
-            # Some tools (get_addresses) put real data in structuredContent.
-            # Others (search_products) leave structuredContent empty and put
-            # valid JSON in the plain text instead. Try both.
-            data = structured if isinstance(structured, dict) else None
+                # Some tools (get_addresses) put real data in structuredContent.
+                # Others (search_products) leave structuredContent empty and put
+                # valid JSON in the plain text instead. Try both.
+                data = structured if isinstance(structured, dict) else None
 
-            if data is None and text_content:
-                try:
-                    parsed_text = _json.loads(text_content)
-                    if isinstance(parsed_text, dict):
-                        data = parsed_text
-                except _json.JSONDecodeError:
-                    pass  # genuinely just conversational text, not JSON - fine
+                if data is None and text_content:
+                    try:
+                        parsed_text = _json.loads(text_content)
+                        if isinstance(parsed_text, dict):
+                            data = parsed_text
+                    except _json.JSONDecodeError:
+                        pass  # genuinely just conversational text, not JSON - fine
 
-            if data is None:
-                raise RuntimeError(f"Swiggy tool '{tool_name}' gave no usable data (see [swiggy_text] log above)")
+                if data is None:
+                    raise RuntimeError(f"Swiggy tool '{tool_name}' gave no usable data (see [swiggy_text] log above)")
+    except RuntimeError:
+        raise  # already a clear, specific error from above - let it propagate as-is
+    except Exception as e:
+        # A failure THIS early (before any of the checks above even run)
+        # is a transport/auth-level problem, not a tool-level one - most
+        # commonly Swiggy's ~5-day login expiring. A real incident showed
+        # this kind of failure escaping uncaught and getting mislabeled
+        # as a generic "couldn't process that voice note" error, even for
+        # typed text messages, which was confusing and inaccurate.
+        error_text = str(e)
+        if "401" in error_text or "Unauthorized" in error_text:
+            raise RuntimeError("Your Swiggy login has expired - run 'python swiggy_login.py' again and update the saved token.") from e
+        raise RuntimeError(f"Couldn't reach Swiggy right now: {e}") from e
 
-            # Some tools wrap the real payload in {"success": true, "data": {...}} -
-            # unwrap it so every caller gets the same flat shape either way.
-            if isinstance(data.get("data"), dict):
-                data = data["data"]
+    # Some tools wrap the real payload in {"success": true, "data": {...}} -
+    # unwrap it so every caller gets the same flat shape either way.
+    if isinstance(data.get("data"), dict):
+        data = data["data"]
 
-            return data
+    return data
 
 
 async def resolve_instamart_address_id(address_label: str, fallback_label: str = None) -> tuple:
@@ -1652,7 +1666,7 @@ async def handle_new_order_request(sender: str, transcript_or_text: str):
             await search_and_confirm(sender, address_id, real_address_label, parsed["items"])
         except RuntimeError as e:
             print(f"[error] Swiggy call failed: {e}")
-            send_whatsapp_message(sender, f"(Box 4 test) Swiggy connection issue: {e}")
+            send_whatsapp_message(sender, f"⚠️ {e}")
     except Exception as e:
         import traceback
         print(f"[error] processing failed: {e}")
