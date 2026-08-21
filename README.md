@@ -23,7 +23,7 @@ ordered for real, with several safety nets in between.
 | `.env.example` | Template for your own `.env` — copy and fill in |
 | `.gitignore` | Keeps secrets and local state out of git |
 | `docs/` | All setup, deployment, and reference documentation |
-| `swiggy_bug_report.txt` | A real bug report filed with Swiggy about a cart-display inconsistency found during testing |
+
 
 ## Where to start
 
